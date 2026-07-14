@@ -6,6 +6,6 @@ RUN pip install requests beautifulsoup4 feedgen flask
 
 COPY streator_fullfeed.py /app/streator_fullfeed.py
 
-EXPOSE 9000
+EXPOSE 9111
 
 CMD ["python3", "/app/streator_fullfeed.py"]
