@@ -57,4 +57,4 @@ def fullfeed():
 if __name__ == "__main__":
     generate_feed()
     threading.Thread(target=refresh_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=9000)
+    app.run(host="0.0.0.0", port=9111)
