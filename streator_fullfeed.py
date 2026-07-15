@@ -8,7 +8,8 @@ import threading
 import time
 
 FEED_URL = "https://thestreatorstandard.com/f.rss"
-ARTICLE_SELECTOR = 'div[data-ux="BlogContent"]'
+#yyeARTICLE_SELECTOR = 'div[data-ux="BlogContent"]'
+ARTICLE_SELECTOR = 'div.blog-post-content'
 REFRESH_INTERVAL = 3600  # 60 minutes
 
 app = Flask(__name__)
