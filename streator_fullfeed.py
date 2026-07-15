@@ -28,29 +28,24 @@ cached_feed = None
 
 def extract_article_html(html: str) -> str:
     """
-    The container HTML does not include the JSON state or the expected
-    blog-post-content wrapper, but it DOES include the full article as a large
-    block of text with many <br> tags.
+    The article body appears directly in the HTML as a large block of text
+    separated by <br> tags, not inside any wrapper element.
 
     Strategy:
-    - Find all <div> elements that contain at least one <br>
-    - Choose the largest such <div> (by character length)
-    - If none found, fall back to a regex that grabs a big <br>-heavy block
+    - Find the largest block of text containing many <br> tags.
+    - Return that block as the article HTML.
     """
-    page = BeautifulSoup(html, "html.parser")
 
-    candidates = []
-    for div in page.find_all("div"):
-        if div.find("br"):
-            candidates.append(str(div))
+    # Find all large <br>-heavy blocks
+    blocks = re.findall(
+        r"((?:[^<]*<br\s*/?>){5,}[^<]*)",
+        html,
+        re.DOTALL
+    )
 
-    if candidates:
-        return max(candidates, key=len)
-
-    # Fallback: any big block of text with lots of <br> tags
-    br_blocks = re.findall(r"((?:[^<]*<br\s*/?>){5,}[^<]*)", html, re.DOTALL)
-    if br_blocks:
-        return br_blocks[0]
+    if blocks:
+        # Return the largest block
+        return max(blocks, key=len)
 
     return "Content not found."
 
