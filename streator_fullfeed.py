@@ -13,7 +13,13 @@ from feedgen.feed import FeedGenerator
 from flask import Flask, Response
 
 FEED_URL = "https://thestreatorstandard.com/f.rss"
-REFRESH_INTERVAL = 3600  # 60 minutes
+
+REFRESH_INTERVAL = 3600  # Refresh normally every 60 minutes
+RETRY_INTERVAL = 300     # Retry failed source-feed downloads after 5 minutes
+
+RSS_TIMEOUT = (10, 60)       # Connect timeout, read timeout
+ARTICLE_TIMEOUT = (10, 30)
+
 DB_PATH = os.environ.get("DB_PATH", "/data/feed_cache.db")
 
 HEADERS = {
@@ -118,7 +124,7 @@ def extract_json_ld_body(soup):
 
 
 def extract_article_html(html):
-    """Extract the article body from an Streator Standard page."""
+    """Extract the full article body from an article page."""
     soup = BeautifulSoup(html, "html.parser")
 
     selectors = [
@@ -163,21 +169,22 @@ def extract_article_html(html):
 
 
 def fetch_article_html(url):
-    # Keep the original /f/... URL from the source RSS feed.
-    response = session.get(url, timeout=15)
+    # Keep the original /f/... article URL from the source RSS feed.
+    response = session.get(url, timeout=ARTICLE_TIMEOUT)
     response.raise_for_status()
     return extract_article_html(response.text)
 
 
 def generate_feed():
+    """Download source feed, fetch uncached articles, and generate the RSS feed."""
     global cached_feed
 
     try:
-        response = session.get(FEED_URL, timeout=15)
+        response = session.get(FEED_URL, timeout=RSS_TIMEOUT)
         response.raise_for_status()
     except requests.RequestException as error:
         logging.error("Could not download source RSS feed: %s", error)
-        return
+        return False
 
     source_feed = BeautifulSoup(response.content, "xml")
 
@@ -189,7 +196,7 @@ def generate_feed():
     feed.language("en")
 
     items = source_feed.find_all("item")
-    logging.info("Refreshing %d source feed entries.", len(items))
+    logging.info("Refreshing %d source-feed entries.", len(items))
 
     for item in items:
         title_tag = item.find("title")
@@ -199,6 +206,8 @@ def generate_feed():
             continue
 
         title = title_tag.get_text(strip=True)
+
+        # Do not change /f/... to /post/... — /f/... is the working URL.
         full_link = link_tag.get_text(strip=True)
 
         content_html = get_cached_article(full_link)
@@ -234,12 +243,21 @@ def generate_feed():
         cached_feed = feed.rss_str(pretty=True)
 
     logging.info("Full-text feed refresh complete.")
+    return True
 
 
 def refresh_loop():
     while True:
-        generate_feed()
-        time.sleep(REFRESH_INTERVAL)
+        succeeded = generate_feed()
+
+        if succeeded:
+            time.sleep(REFRESH_INTERVAL)
+        else:
+            logging.info(
+                "Source feed refresh failed; retrying in %d seconds.",
+                RETRY_INTERVAL,
+            )
+            time.sleep(RETRY_INTERVAL)
 
 
 @app.route("/fullfeed.xml")
