@@ -15,11 +15,12 @@ from flask import Flask, Response
 
 FEED_URL = "https://thestreatorstandard.com/f.rss"
 
-REFRESH_INTERVAL = 3600  # Normal refresh: 60 minutes
-RETRY_INTERVAL = 300     # Retry source-feed failure: 5 minutes
+REFRESH_INTERVAL = 3600  # 60 minutes after a successful refresh
+RETRY_INTERVAL = 300     # Retry source-feed failure after 5 minutes
 
 RSS_TIMEOUT = 10
 ARTICLE_TIMEOUT = 15
+ARTICLE_DELAY = 1.0      # One second between article downloads during backfill
 
 DB_PATH = os.environ.get("DB_PATH", "/data/feed_cache.db")
 
@@ -62,59 +63,6 @@ def init_database():
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
-
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS seen_items (
-                url TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                first_seen_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-        """)
-
-
-def get_setting(key):
-    with get_connection() as connection:
-        row = connection.execute(
-            "SELECT value FROM settings WHERE key = ?",
-            (key,),
-        ).fetchone()
-
-    return row[0] if row else None
-
-
-def set_setting(key, value):
-    with get_connection() as connection:
-        connection.execute("""
-            INSERT INTO settings (key, value)
-            VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """, (key, value))
-
-
-def is_seen(url):
-    with get_connection() as connection:
-        row = connection.execute(
-            "SELECT 1 FROM seen_items WHERE url = ?",
-            (url,),
-        ).fetchone()
-
-    return row is not None
-
-
-def mark_seen(url, title):
-    with get_connection() as connection:
-        connection.execute("""
-            INSERT INTO seen_items (url, title)
-            VALUES (?, ?)
-            ON CONFLICT(url) DO NOTHING
-        """, (url, title))
 
 
 def get_cached_article(url):
@@ -179,7 +127,7 @@ def extract_json_ld_body(soup):
 
 
 def extract_article_html(html):
-    """Extract the article body from a Streator Standard article page."""
+    """Extract the full article body from a Streator Standard article page."""
     soup = BeautifulSoup(html, "html.parser")
 
     selectors = [
@@ -221,7 +169,7 @@ def extract_article_html(html):
     if len(paragraphs) >= 3:
         return "".join(paragraphs)
 
-    # Fallback for pages that use repeated <br> tags instead of paragraphs.
+    # Fallback for pages using repeated <br> tags instead of <p> tags.
     blocks = re.findall(
         r"((?:[^<]*<br\s*/?>\s*){3,}[^<]*)",
         html,
@@ -235,7 +183,7 @@ def extract_article_html(html):
 
 
 def fetch_article_html(url):
-    # Keep the original /f/... URL. Do not convert it to /post/....
+    # Keep the original /f/... URL from the source RSS feed.
     response = requests.get(
         url,
         headers=HEADERS,
@@ -246,60 +194,24 @@ def fetch_article_html(url):
     return extract_article_html(response.text)
 
 
-def source_description(item):
-    """Use the source feed's description for historical, uncached entries."""
-    description_tag = item.find("description")
-
-    if not description_tag:
-        return "<p>Full article content is not available.</p>"
-
-    text = description_tag.get_text(" ", strip=True)
-
-    if not text:
-        return "<p>Full article content is not available.</p>"
-
-    return f"<p>{escape(text)}</p>"
-
-
 def generate_feed():
+    """Create the full-text RSS feed and cache uncached article bodies."""
     global cached_feed
 
     try:
-        # This deliberately matches the original request style.
-        rss = requests.get(
+        # Uses the same request pattern as the original working script.
+        response = requests.get(
             FEED_URL,
             headers=HEADERS,
             timeout=RSS_TIMEOUT,
         )
-        rss.raise_for_status()
+        response.raise_for_status()
     except requests.RequestException as error:
         logging.error("Could not download source RSS feed: %s", error)
         return False
 
-    source_feed = BeautifulSoup(rss.content, "xml")
+    source_feed = BeautifulSoup(response.content, "xml")
     items = source_feed.find_all("item")
-
-    first_successful_run = get_setting("baseline_created") is None
-
-    if first_successful_run:
-        # Record current articles as historical without downloading them.
-        # Only articles published after this point will be fetched in full.
-        for item in items:
-            title_tag = item.find("title")
-            link_tag = item.find("link")
-
-            if title_tag and link_tag:
-                mark_seen(
-                    link_tag.get_text(strip=True),
-                    title_tag.get_text(strip=True),
-                )
-
-        set_setting("baseline_created", "true")
-        logging.info(
-            "Created baseline from %d existing articles; "
-            "future articles will be downloaded in full.",
-            len(items),
-        )
 
     feed = FeedGenerator()
     feed.id("streator-standard-full-feed")
@@ -308,99 +220,10 @@ def generate_feed():
     feed.description("Full-text feed generated locally")
     feed.language("en")
 
+    logging.info("Refreshing %d source-feed entries.", len(items))
+
     for item in items:
         title_tag = item.find("title")
         link_tag = item.find("link")
 
-        if not title_tag or not link_tag:
-            continue
-
-        title = title_tag.get_text(strip=True)
-        article_url = link_tag.get_text(strip=True)
-
-        content_html = get_cached_article(article_url)
-
-        # A URL not in seen_items is a newly published article.
-        if content_html is None and not is_seen(article_url):
-            try:
-                content_html = fetch_article_html(article_url)
-                save_article(article_url, title, content_html)
-                mark_seen(article_url, title)
-                logging.info("Downloaded and cached new article: %s", title)
-            except requests.RequestException as error:
-                logging.warning(
-                    "Could not download new article %s: %s",
-                    article_url,
-                    error,
-                )
-                content_html = source_description(item)
-            except Exception:
-                logging.exception(
-                    "Could not extract new article: %s",
-                    article_url,
-                )
-                content_html = source_description(item)
-
-        # Historical entries show their original source-feed description.
-        if content_html is None:
-            content_html = source_description(item)
-
-        plain_description = BeautifulSoup(
-            content_html,
-            "html.parser",
-        ).get_text(" ", strip=True)
-
-        entry = feed.add_entry()
-        entry.id(article_url)
-        entry.guid(article_url, permalink=True)
-        entry.title(title)
-        entry.link(href=article_url)
-        entry.description(plain_description)
-        entry.content(content_html, type="html")
-
-    with feed_lock:
-        cached_feed = feed.rss_str(pretty=True)
-
-    logging.info("Full-text feed refresh complete.")
-    return True
-
-
-def refresh_loop():
-    while True:
-        succeeded = generate_feed()
-
-        if succeeded:
-            time.sleep(REFRESH_INTERVAL)
-        else:
-            logging.info(
-                "Source feed refresh failed; retrying in %d seconds.",
-                RETRY_INTERVAL,
-            )
-            time.sleep(RETRY_INTERVAL)
-
-
-@app.route("/fullfeed.xml")
-def fullfeed():
-    with feed_lock:
-        feed = cached_feed
-
-    if feed is None:
-        return Response(
-            "Feed is building. Please try again shortly.",
-            status=503,
-            mimetype="text/plain",
-        )
-
-    return Response(feed, mimetype="application/rss+xml")
-
-
-if __name__ == "__main__":
-    init_database()
-
-    threading.Thread(
-        target=refresh_loop,
-        daemon=True,
-        name="feed-refresh",
-    ).start()
-
-    app.run(host="0.0.0.0", port=9111)
+       
