@@ -4,14 +4,12 @@ from bs4 import BeautifulSoup
 from feedgen.feed import FeedGenerator
 from flask import Flask, Response
 import re
-import json
 import threading
 import time
 
 FEED_URL = "https://thestreatorstandard.com/f.rss"
 REFRESH_INTERVAL = 3600  # 60 minutes
 
-# Browser-like headers so GoDaddy treats us as a real client
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -30,54 +28,36 @@ cached_feed = None
 
 def extract_article_html(html: str) -> str:
     """
-    GoDaddy Websites+Marketing injects blog content via a JS state object
-    (window.__INITIAL_STATE__). The raw HTML contains a <script> tag with that
-    object; the DOM that the browser sees is built from it.
+    The container HTML does not include the JSON state or the expected
+    blog-post-content wrapper, but it DOES include the full article as a large
+    block of text with many <br> tags.
 
-    We:
-    - find the <script> containing "__INITIAL_STATE__"
-    - regex out the JSON object
-    - parse it
-    - pull articleBody from blog.posts[*]
+    Strategy:
+    - Find all <div> elements that contain at least one <br>
+    - Choose the largest such <div> (by character length)
+    - If none found, fall back to a regex that grabs a big <br>-heavy block
     """
     page = BeautifulSoup(html, "html.parser")
 
-    # Find the script tag that contains __INITIAL_STATE__
-    script = page.find("script", string=re.compile("__INITIAL_STATE__"))
-    if not script or not script.string:
-        return "Content not found."
+    candidates = []
+    for div in page.find_all("div"):
+        if div.find("br"):
+            candidates.append(str(div))
 
-    # Extract JSON object assigned to window.__INITIAL_STATE__
-    match = re.search(r"__INITIAL_STATE__\s*=\s*(\{.*\});", script.string, re.DOTALL)
-    if not match:
-        return "Content not found."
+    if candidates:
+        return max(candidates, key=len)
 
-    try:
-        state = json.loads(match.group(1))
-    except Exception as e:
-        return f"Content not found (JSON parse error: {e})"
+    # Fallback: any big block of text with lots of <br> tags
+    br_blocks = re.findall(r"((?:[^<]*<br\s*/?>){5,}[^<]*)", html, re.DOTALL)
+    if br_blocks:
+        return br_blocks[0]
 
-    # Navigate into the blog posts structure
-    blog = state.get("blog", {})
-    posts = blog.get("posts", {})
-
-    if not posts:
-        return "Content not found."
-
-    # There should be exactly one post on a /post/<slug> page
-    post = list(posts.values())[0]
-    content_html = post.get("articleBody") or post.get("description")
-
-    if not content_html:
-        return "Content not found."
-
-    return content_html
+    return "Content not found."
 
 
 def generate_feed():
     global cached_feed
 
-    # Fetch RSS with browser-like headers
     rss = requests.get(FEED_URL, headers=HEADERS, timeout=10).text
     soup = BeautifulSoup(rss, "xml")
 
@@ -90,7 +70,7 @@ def generate_feed():
         title = item.title.text
         link = item.link.text
 
-        # Rewrite /f/<slug> → /post/<slug> to hit the full article page
+        # Rewrite /f/<slug> → /post/<slug>
         full_link = re.sub(r"/f/(.*)$", r"/post/\1", link)
 
         try:
