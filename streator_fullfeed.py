@@ -130,6 +130,10 @@ def extract_article_html(html):
     """Extract the full article body from a Streator Standard article page."""
     soup = BeautifulSoup(html, "html.parser")
 
+    json_ld_body = extract_json_ld_body(soup)
+    if json_ld_body:
+        return json_ld_body
+
     selectors = [
         "[itemprop='articleBody']",
         ".article-body",
@@ -137,7 +141,6 @@ def extract_article_html(html):
         ".post-content",
         ".entry-content",
         "article",
-        "main",
     ]
 
     for selector in selectors:
@@ -156,20 +159,7 @@ def extract_article_html(html):
         if len(content.get_text(" ", strip=True)) > 300:
             return str(content)
 
-    json_ld_body = extract_json_ld_body(soup)
-    if json_ld_body:
-        return json_ld_body
-
-    paragraphs = []
-    for paragraph in soup.find_all("p"):
-        text = paragraph.get_text(" ", strip=True)
-        if len(text) >= 40:
-            paragraphs.append(f"<p>{escape(text)}</p>")
-
-    if len(paragraphs) >= 3:
-        return "".join(paragraphs)
-
-    # Fallback for pages using repeated <br> tags instead of <p> tags.
+    # Streator Standard's article text uses repeated <br> elements.
     blocks = re.findall(
         r"((?:[^<]*<br\s*/?>\s*){3,}[^<]*)",
         html,
@@ -191,21 +181,10 @@ def fetch_article_html(url):
 
     content_html = extract_article_html(response.text)
 
-    if content_html == "<p>Content not found.</p>":
+    if not content_html:
         raise ValueError("Article body was not found")
 
     return content_html
-
-#def fetch_article_html(url):
-#    # Keep the original /f/... URL from the source RSS feed.
-#    response = requests.get(
-#        url,
-#        headers=HEADERS,
-#        timeout=ARTICLE_TIMEOUT,
-#    )
-#    response.raise_for_status()
-#
-#    return extract_article_html(response.text)
 
 
 def generate_feed():
