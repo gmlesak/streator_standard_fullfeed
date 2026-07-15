@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import json
 import logging
-import re
 import threading
 import time
 from html import escape
@@ -12,7 +11,7 @@ from feedgen.feed import FeedGenerator
 from flask import Flask, Response
 
 FEED_URL = "https://thestreatorstandard.com/f.rss"
-REFRESH_INTERVAL = 3600  # Refresh every 60 minutes
+REFRESH_INTERVAL = 3600  # 60 minutes
 
 HEADERS = {
     "User-Agent": (
@@ -38,8 +37,8 @@ logging.basicConfig(
 )
 
 
-def extract_json_ld_article_body(soup: BeautifulSoup) -> str | None:
-    """Look for full text exposed in Schema.org JSON-LD metadata."""
+def extract_json_ld_body(soup):
+    """Return an articleBody value from Schema.org JSON-LD, if present."""
     for script in soup.select('script[type="application/ld+json"]'):
         try:
             data = json.loads(script.string or "")
@@ -60,23 +59,31 @@ def extract_json_ld_article_body(soup: BeautifulSoup) -> str | None:
                 if not isinstance(candidate, dict):
                     continue
 
-                article_body = candidate.get("articleBody")
-                if article_body and len(article_body.strip()) > 100:
-                    paragraphs = [
+                body = candidate.get("articleBody")
+                if body and len(body.strip()) > 200:
+                    return "".join(
                         f"<p>{escape(paragraph.strip())}</p>"
-                        for paragraph in article_body.splitlines()
+                        for paragraph in body.splitlines()
                         if paragraph.strip()
-                    ]
-                    return "".join(paragraphs)
+                    )
 
     return None
 
 
-def extract_article_html(html: str) -> str:
-    """Extract the article body and return safe article HTML."""
+def remove_page_furniture(element):
+    """Remove navigation, scripts, social buttons, and similar non-article items."""
+    for unwanted in element.select(
+        "script, style, noscript, nav, header, footer, form, aside, "
+        ".share, .social, .advertisement, .ad, .comments, .cookie"
+    ):
+        unwanted.decompose()
+
+
+def extract_article_html(html):
+    """Extract full article HTML from an Streator Standard article page."""
     soup = BeautifulSoup(html, "html.parser")
 
-    # Check common article-content containers first.
+    # First try article-specific containers.
     selectors = [
         "[itemprop='articleBody']",
         ".article-body",
@@ -89,64 +96,54 @@ def extract_article_html(html: str) -> str:
 
     for selector in selectors:
         candidates = soup.select(selector)
-
         if not candidates:
             continue
 
-        # Prefer the largest matching element.
         content = max(
             candidates,
             key=lambda tag: len(tag.get_text(" ", strip=True)),
         )
 
-        # Ignore a candidate that clearly is not an article.
-        if len(content.get_text(" ", strip=True)) < 200:
-            continue
+        remove_page_furniture(content)
 
-        # Remove page furniture and non-article content.
-        for unwanted in content.select(
-            "script, style, noscript, nav, header, footer, form, "
-            "aside, .share, .social, .advertisement, .ad, .comments"
-        ):
-            unwanted.decompose()
-
-        if len(content.get_text(" ", strip=True)) >= 200:
+        if len(content.get_text(" ", strip=True)) > 300:
             return str(content)
 
-    # Some sites store the body in structured metadata instead of visible markup.
-    json_ld_body = extract_json_ld_article_body(soup)
+    # Next try structured article metadata.
+    json_ld_body = extract_json_ld_body(soup)
     if json_ld_body:
         return json_ld_body
 
-    # Final fallback: retain meaningful paragraph text.
+    # Fallback: build article HTML from meaningful paragraphs.
     paragraphs = []
     for paragraph in soup.find_all("p"):
         text = paragraph.get_text(" ", strip=True)
         if len(text) >= 40:
             paragraphs.append(f"<p>{escape(text)}</p>")
 
-    if paragraphs:
+    if len(paragraphs) >= 3:
         return "".join(paragraphs)
 
     return "<p>Content not found.</p>"
 
 
-def get_full_article_url(feed_url: str) -> str:
-    """Convert the site's shortened feed URL to its full post URL."""
-    return re.sub(r"/f/(.+)$", r"/post/\1", feed_url)
+def fetch_article_html(url):
+    """
+    Download the article.
 
-
-def fetch_article_html(url: str) -> str:
-    response = session.get(url, timeout=20)
+    Important: Streator Standard's real article URLs use /f/... .
+    Do NOT rewrite them to /post/... .
+    """
+    response = session.get(url, timeout=45)
     response.raise_for_status()
     return extract_article_html(response.text)
 
 
-def generate_feed() -> None:
+def generate_feed():
     global cached_feed
 
     try:
-        response = session.get(FEED_URL, timeout=20)
+        response = session.get(FEED_URL, timeout=45)
         response.raise_for_status()
     except requests.RequestException as error:
         logging.error("Could not download source RSS feed: %s", error)
@@ -155,10 +152,9 @@ def generate_feed() -> None:
     source_feed = BeautifulSoup(response.content, "xml")
 
     feed = FeedGenerator()
-    feed.id("https://thestreatorstandard.com/fullfeed.xml")
+    feed.id("streator-standard-full-feed")
     feed.title("Streator Standard – Full Articles")
     feed.link(href="https://thestreatorstandard.com/", rel="alternate")
-    feed.link(href="https://thestreatorstandard.com/fullfeed.xml", rel="self")
     feed.description("Full-text feed generated locally")
     feed.language("en")
 
@@ -173,21 +169,23 @@ def generate_feed() -> None:
             continue
 
         title = title_tag.get_text(strip=True)
-        source_link = link_tag.get_text(strip=True)
-        full_link = get_full_article_url(source_link)
+
+        # Keep the original /f/... article URL from the source RSS feed.
+        full_link = link_tag.get_text(strip=True)
 
         try:
             content_html = fetch_article_html(full_link)
-            logging.info("Extracted article: %s", title)
+            logging.info("Extracted: %s", title)
         except requests.RequestException as error:
-            logging.warning("Could not fetch %s: %s", full_link, error)
+            logging.warning("Download failed for %s: %s", full_link, error)
             content_html = "<p>Article content could not be downloaded.</p>"
         except Exception:
-            logging.exception("Could not extract article: %s", full_link)
+            logging.exception("Extraction failed for %s", full_link)
             content_html = "<p>Article content could not be extracted.</p>"
 
         plain_description = BeautifulSoup(
-            content_html, "html.parser"
+            content_html,
+            "html.parser",
         ).get_text(" ", strip=True)
 
         entry = feed.add_entry()
@@ -203,10 +201,10 @@ def generate_feed() -> None:
     with feed_lock:
         cached_feed = new_feed
 
-    logging.info("Full-text feed refreshed successfully.")
+    logging.info("Full-text feed refresh complete.")
 
 
-def refresh_loop() -> None:
+def refresh_loop():
     while True:
         generate_feed()
         time.sleep(REFRESH_INTERVAL)
@@ -221,6 +219,7 @@ def fullfeed():
 
     if feed is None:
         generate_feed()
+
         with feed_lock:
             feed = cached_feed
 
