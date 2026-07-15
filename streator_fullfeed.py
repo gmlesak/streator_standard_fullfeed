@@ -211,7 +211,7 @@ def generate_feed():
         return False
 
     source_feed = BeautifulSoup(response.content, "xml")
-    items = source_feed.find_all("item")
+    items = list(reversed(source_feed.find_all("item")))
 
     feed = FeedGenerator()
     feed.id("streator-standard-full-feed")
@@ -226,4 +226,98 @@ def generate_feed():
         title_tag = item.find("title")
         link_tag = item.find("link")
 
-       
+        if not title_tag or not link_tag:
+            continue
+
+        title = title_tag.get_text(strip=True)
+        article_url = link_tag.get_text(strip=True)
+
+        content_html = get_cached_article(article_url)
+
+        # Download only articles that have never been cached.
+        if content_html is None:
+            try:
+                content_html = fetch_article_html(article_url)
+                save_article(article_url, title, content_html)
+                logging.info("Downloaded and cached: %s", title)
+
+                # Keep the one-time historical backfill gentle.
+                time.sleep(ARTICLE_DELAY)
+
+            except requests.RequestException as error:
+                logging.warning(
+                    "Could not download %s: %s",
+                    article_url,
+                    error,
+                )
+                content_html = (
+                    "<p>Full article content is temporarily unavailable. "
+                    "It will be retried during the next refresh.</p>"
+                )
+
+            except Exception:
+                logging.exception("Could not extract article: %s", article_url)
+                content_html = (
+                    "<p>Full article content could not be extracted yet. "
+                    "It will be retried during the next refresh.</p>"
+                )
+
+        plain_description = BeautifulSoup(
+            content_html,
+            "html.parser",
+        ).get_text(" ", strip=True)
+
+        entry = feed.add_entry()
+        entry.id(article_url)
+        entry.guid(article_url, permalink=True)
+        entry.title(title)
+        entry.link(href=article_url)
+        entry.description(plain_description)
+        entry.content(content_html, type="html")
+
+    with feed_lock:
+        cached_feed = feed.rss_str(pretty=True)
+
+    logging.info("Full-text feed refresh complete.")
+    return True
+
+
+def refresh_loop():
+    while True:
+        succeeded = generate_feed()
+
+        if succeeded:
+            time.sleep(REFRESH_INTERVAL)
+        else:
+            logging.info(
+                "Source feed refresh failed; retrying in %d seconds.",
+                RETRY_INTERVAL,
+            )
+            time.sleep(RETRY_INTERVAL)
+
+
+@app.route("/fullfeed.xml")
+def fullfeed():
+    with feed_lock:
+        feed = cached_feed
+
+    if feed is None:
+        return Response(
+            "Feed is building. Please try again shortly.",
+            status=503,
+            mimetype="text/plain",
+        )
+
+    return Response(feed, mimetype="application/rss+xml")
+
+
+if __name__ == "__main__":
+    init_database()
+
+    threading.Thread(
+        target=refresh_loop,
+        daemon=True,
+        name="feed-refresh",
+    ).start()
+
+    app.run(host="0.0.0.0", port=9111)
