@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import json
 import logging
+import os
+import sqlite3
 import threading
 import time
 from html import escape
@@ -12,6 +14,7 @@ from flask import Flask, Response
 
 FEED_URL = "https://thestreatorstandard.com/f.rss"
 REFRESH_INTERVAL = 3600  # 60 minutes
+DB_PATH = os.environ.get("DB_PATH", "/data/feed_cache.db")
 
 HEADERS = {
     "User-Agent": (
@@ -37,8 +40,52 @@ logging.basicConfig(
 )
 
 
+def init_database():
+    directory = os.path.dirname(DB_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS articles (
+                url TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                content_html TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+
+def get_cached_article(url):
+    with sqlite3.connect(DB_PATH) as connection:
+        row = connection.execute(
+            "SELECT content_html FROM articles WHERE url = ?",
+            (url,),
+        ).fetchone()
+
+    return row[0] if row else None
+
+
+def save_article(url, title, content_html):
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute("""
+            INSERT INTO articles (url, title, content_html)
+            VALUES (?, ?, ?)
+            ON CONFLICT(url) DO UPDATE SET
+                title = excluded.title,
+                content_html = excluded.content_html
+        """, (url, title, content_html))
+
+
+def remove_page_furniture(element):
+    for unwanted in element.select(
+        "script, style, noscript, nav, header, footer, form, aside, "
+        ".share, .social, .advertisement, .ad, .comments, .cookie"
+    ):
+        unwanted.decompose()
+
+
 def extract_json_ld_body(soup):
-    """Return an articleBody value from Schema.org JSON-LD, if present."""
     for script in soup.select('script[type="application/ld+json"]'):
         try:
             data = json.loads(script.string or "")
@@ -70,20 +117,10 @@ def extract_json_ld_body(soup):
     return None
 
 
-def remove_page_furniture(element):
-    """Remove navigation, scripts, social buttons, and similar non-article items."""
-    for unwanted in element.select(
-        "script, style, noscript, nav, header, footer, form, aside, "
-        ".share, .social, .advertisement, .ad, .comments, .cookie"
-    ):
-        unwanted.decompose()
-
-
 def extract_article_html(html):
-    """Extract full article HTML from an Streator Standard article page."""
+    """Extract the article body from an Streator Standard page."""
     soup = BeautifulSoup(html, "html.parser")
 
-    # First try article-specific containers.
     selectors = [
         "[itemprop='articleBody']",
         ".article-body",
@@ -109,12 +146,10 @@ def extract_article_html(html):
         if len(content.get_text(" ", strip=True)) > 300:
             return str(content)
 
-    # Next try structured article metadata.
     json_ld_body = extract_json_ld_body(soup)
     if json_ld_body:
         return json_ld_body
 
-    # Fallback: build article HTML from meaningful paragraphs.
     paragraphs = []
     for paragraph in soup.find_all("p"):
         text = paragraph.get_text(" ", strip=True)
@@ -128,13 +163,8 @@ def extract_article_html(html):
 
 
 def fetch_article_html(url):
-    """
-    Download the article.
-
-    Important: Streator Standard's real article URLs use /f/... .
-    Do NOT rewrite them to /post/... .
-    """
-    response = session.get(url, timeout=45)
+    # Keep the original /f/... URL from the source RSS feed.
+    response = session.get(url, timeout=15)
     response.raise_for_status()
     return extract_article_html(response.text)
 
@@ -143,7 +173,7 @@ def generate_feed():
     global cached_feed
 
     try:
-        response = session.get(FEED_URL, timeout=45)
+        response = session.get(FEED_URL, timeout=15)
         response.raise_for_status()
     except requests.RequestException as error:
         logging.error("Could not download source RSS feed: %s", error)
@@ -159,7 +189,7 @@ def generate_feed():
     feed.language("en")
 
     items = source_feed.find_all("item")
-    logging.info("Refreshing %d feed entries.", len(items))
+    logging.info("Refreshing %d source feed entries.", len(items))
 
     for item in items:
         title_tag = item.find("title")
@@ -169,19 +199,23 @@ def generate_feed():
             continue
 
         title = title_tag.get_text(strip=True)
-
-        # Keep the original /f/... article URL from the source RSS feed.
         full_link = link_tag.get_text(strip=True)
 
-        try:
-            content_html = fetch_article_html(full_link)
-            logging.info("Extracted: %s", title)
-        except requests.RequestException as error:
-            logging.warning("Download failed for %s: %s", full_link, error)
-            content_html = "<p>Article content could not be downloaded.</p>"
-        except Exception:
-            logging.exception("Extraction failed for %s", full_link)
-            content_html = "<p>Article content could not be extracted.</p>"
+        content_html = get_cached_article(full_link)
+
+        if content_html is None:
+            try:
+                content_html = fetch_article_html(full_link)
+                save_article(full_link, title, content_html)
+                logging.info("Downloaded and cached: %s", title)
+            except requests.RequestException as error:
+                logging.warning("Download failed for %s: %s", full_link, error)
+                content_html = "<p>Article content could not be downloaded.</p>"
+            except Exception:
+                logging.exception("Extraction failed for %s", full_link)
+                content_html = "<p>Article content could not be extracted.</p>"
+        else:
+            logging.info("Using cached article: %s", title)
 
         plain_description = BeautifulSoup(
             content_html,
@@ -196,10 +230,8 @@ def generate_feed():
         entry.description(plain_description)
         entry.content(content_html, type="html")
 
-    new_feed = feed.rss_str(pretty=True)
-
     with feed_lock:
-        cached_feed = new_feed
+        cached_feed = feed.rss_str(pretty=True)
 
     logging.info("Full-text feed refresh complete.")
 
@@ -212,20 +244,12 @@ def refresh_loop():
 
 @app.route("/fullfeed.xml")
 def fullfeed():
-    global cached_feed
-
     with feed_lock:
         feed = cached_feed
 
     if feed is None:
-        generate_feed()
-
-        with feed_lock:
-            feed = cached_feed
-
-    if feed is None:
         return Response(
-            "Feed is not available yet. Please try again shortly.",
+            "Feed is building. Please try again shortly.",
             status=503,
             mimetype="text/plain",
         )
@@ -234,7 +258,7 @@ def fullfeed():
 
 
 if __name__ == "__main__":
-    generate_feed()
+    init_database()
 
     threading.Thread(
         target=refresh_loop,

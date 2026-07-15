@@ -2,7 +2,7 @@ name: Build and Publish Docker Image
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
 
 jobs:
@@ -25,9 +25,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build image
-        run: |
-          docker build -t ghcr.io/gmlesak/streator-fullfeed:latest .
+        run: docker build -t ghcr.io/gmlesak/streator-fullfeed:latest .
 
       - name: Push image
-        run: |
-          docker push ghcr.io/gmlesak/streator-fullfeed:latest
+        run: docker push ghcr.io/gmlesak/streator-fullfeed:latest
