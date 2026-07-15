@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -14,11 +15,11 @@ from flask import Flask, Response
 
 FEED_URL = "https://thestreatorstandard.com/f.rss"
 
-REFRESH_INTERVAL = 3600  # Refresh normally every 60 minutes
-RETRY_INTERVAL = 300     # Retry failed source-feed downloads after 5 minutes
+REFRESH_INTERVAL = 3600  # Normal refresh: 60 minutes
+RETRY_INTERVAL = 300     # Retry source-feed failure: 5 minutes
 
-RSS_TIMEOUT = (10, 60)       # Connect timeout, read timeout
-ARTICLE_TIMEOUT = (10, 30)
+RSS_TIMEOUT = 10
+ARTICLE_TIMEOUT = 15
 
 DB_PATH = os.environ.get("DB_PATH", "/data/feed_cache.db")
 
@@ -34,9 +35,6 @@ HEADERS = {
 }
 
 app = Flask(__name__)
-session = requests.Session()
-session.headers.update(HEADERS)
-
 cached_feed = None
 feed_lock = threading.Lock()
 
@@ -46,12 +44,16 @@ logging.basicConfig(
 )
 
 
+def get_connection():
+    return sqlite3.connect(DB_PATH)
+
+
 def init_database():
     directory = os.path.dirname(DB_PATH)
     if directory:
         os.makedirs(directory, exist_ok=True)
 
-    with sqlite3.connect(DB_PATH) as connection:
+    with get_connection() as connection:
         connection.execute("""
             CREATE TABLE IF NOT EXISTS articles (
                 url TEXT PRIMARY KEY,
@@ -61,9 +63,62 @@ def init_database():
             )
         """)
 
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS seen_items (
+                url TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                first_seen_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+
+
+def get_setting(key):
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT value FROM settings WHERE key = ?",
+            (key,),
+        ).fetchone()
+
+    return row[0] if row else None
+
+
+def set_setting(key, value):
+    with get_connection() as connection:
+        connection.execute("""
+            INSERT INTO settings (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """, (key, value))
+
+
+def is_seen(url):
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT 1 FROM seen_items WHERE url = ?",
+            (url,),
+        ).fetchone()
+
+    return row is not None
+
+
+def mark_seen(url, title):
+    with get_connection() as connection:
+        connection.execute("""
+            INSERT INTO seen_items (url, title)
+            VALUES (?, ?)
+            ON CONFLICT(url) DO NOTHING
+        """, (url, title))
+
 
 def get_cached_article(url):
-    with sqlite3.connect(DB_PATH) as connection:
+    with get_connection() as connection:
         row = connection.execute(
             "SELECT content_html FROM articles WHERE url = ?",
             (url,),
@@ -73,7 +128,7 @@ def get_cached_article(url):
 
 
 def save_article(url, title, content_html):
-    with sqlite3.connect(DB_PATH) as connection:
+    with get_connection() as connection:
         connection.execute("""
             INSERT INTO articles (url, title, content_html)
             VALUES (?, ?, ?)
@@ -124,7 +179,7 @@ def extract_json_ld_body(soup):
 
 
 def extract_article_html(html):
-    """Extract the full article body from an article page."""
+    """Extract the article body from a Streator Standard article page."""
     soup = BeautifulSoup(html, "html.parser")
 
     selectors = [
@@ -139,6 +194,7 @@ def extract_article_html(html):
 
     for selector in selectors:
         candidates = soup.select(selector)
+
         if not candidates:
             continue
 
@@ -165,28 +221,85 @@ def extract_article_html(html):
     if len(paragraphs) >= 3:
         return "".join(paragraphs)
 
+    # Fallback for pages that use repeated <br> tags instead of paragraphs.
+    blocks = re.findall(
+        r"((?:[^<]*<br\s*/?>\s*){3,}[^<]*)",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    if blocks:
+        return max(blocks, key=len)
+
     return "<p>Content not found.</p>"
 
 
 def fetch_article_html(url):
-    # Keep the original /f/... article URL from the source RSS feed.
-    response = session.get(url, timeout=ARTICLE_TIMEOUT)
+    # Keep the original /f/... URL. Do not convert it to /post/....
+    response = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=ARTICLE_TIMEOUT,
+    )
     response.raise_for_status()
+
     return extract_article_html(response.text)
 
 
+def source_description(item):
+    """Use the source feed's description for historical, uncached entries."""
+    description_tag = item.find("description")
+
+    if not description_tag:
+        return "<p>Full article content is not available.</p>"
+
+    text = description_tag.get_text(" ", strip=True)
+
+    if not text:
+        return "<p>Full article content is not available.</p>"
+
+    return f"<p>{escape(text)}</p>"
+
+
 def generate_feed():
-    """Download source feed, fetch uncached articles, and generate the RSS feed."""
     global cached_feed
 
     try:
-        response = session.get(FEED_URL, timeout=RSS_TIMEOUT)
-        response.raise_for_status()
+        # This deliberately matches the original request style.
+        rss = requests.get(
+            FEED_URL,
+            headers=HEADERS,
+            timeout=RSS_TIMEOUT,
+        )
+        rss.raise_for_status()
     except requests.RequestException as error:
         logging.error("Could not download source RSS feed: %s", error)
         return False
 
-    source_feed = BeautifulSoup(response.content, "xml")
+    source_feed = BeautifulSoup(rss.content, "xml")
+    items = source_feed.find_all("item")
+
+    first_successful_run = get_setting("baseline_created") is None
+
+    if first_successful_run:
+        # Record current articles as historical without downloading them.
+        # Only articles published after this point will be fetched in full.
+        for item in items:
+            title_tag = item.find("title")
+            link_tag = item.find("link")
+
+            if title_tag and link_tag:
+                mark_seen(
+                    link_tag.get_text(strip=True),
+                    title_tag.get_text(strip=True),
+                )
+
+        set_setting("baseline_created", "true")
+        logging.info(
+            "Created baseline from %d existing articles; "
+            "future articles will be downloaded in full.",
+            len(items),
+        )
 
     feed = FeedGenerator()
     feed.id("streator-standard-full-feed")
@@ -194,9 +307,6 @@ def generate_feed():
     feed.link(href="https://thestreatorstandard.com/", rel="alternate")
     feed.description("Full-text feed generated locally")
     feed.language("en")
-
-    items = source_feed.find_all("item")
-    logging.info("Refreshing %d source-feed entries.", len(items))
 
     for item in items:
         title_tag = item.find("title")
@@ -206,25 +316,34 @@ def generate_feed():
             continue
 
         title = title_tag.get_text(strip=True)
+        article_url = link_tag.get_text(strip=True)
 
-        # Do not change /f/... to /post/... — /f/... is the working URL.
-        full_link = link_tag.get_text(strip=True)
+        content_html = get_cached_article(article_url)
 
-        content_html = get_cached_article(full_link)
-
-        if content_html is None:
+        # A URL not in seen_items is a newly published article.
+        if content_html is None and not is_seen(article_url):
             try:
-                content_html = fetch_article_html(full_link)
-                save_article(full_link, title, content_html)
-                logging.info("Downloaded and cached: %s", title)
+                content_html = fetch_article_html(article_url)
+                save_article(article_url, title, content_html)
+                mark_seen(article_url, title)
+                logging.info("Downloaded and cached new article: %s", title)
             except requests.RequestException as error:
-                logging.warning("Download failed for %s: %s", full_link, error)
-                content_html = "<p>Article content could not be downloaded.</p>"
+                logging.warning(
+                    "Could not download new article %s: %s",
+                    article_url,
+                    error,
+                )
+                content_html = source_description(item)
             except Exception:
-                logging.exception("Extraction failed for %s", full_link)
-                content_html = "<p>Article content could not be extracted.</p>"
-        else:
-            logging.info("Using cached article: %s", title)
+                logging.exception(
+                    "Could not extract new article: %s",
+                    article_url,
+                )
+                content_html = source_description(item)
+
+        # Historical entries show their original source-feed description.
+        if content_html is None:
+            content_html = source_description(item)
 
         plain_description = BeautifulSoup(
             content_html,
@@ -232,10 +351,10 @@ def generate_feed():
         ).get_text(" ", strip=True)
 
         entry = feed.add_entry()
-        entry.id(full_link)
-        entry.guid(full_link, permalink=True)
+        entry.id(article_url)
+        entry.guid(article_url, permalink=True)
         entry.title(title)
-        entry.link(href=full_link)
+        entry.link(href=article_url)
         entry.description(plain_description)
         entry.content(content_html, type="html")
 
