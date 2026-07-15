@@ -181,9 +181,7 @@ def extract_article_html(html):
 
     return "<p>Content not found.</p>"
 
-
 def fetch_article_html(url):
-    # Keep the original /f/... URL from the source RSS feed.
     response = requests.get(
         url,
         headers=HEADERS,
@@ -191,7 +189,23 @@ def fetch_article_html(url):
     )
     response.raise_for_status()
 
-    return extract_article_html(response.text)
+    content_html = extract_article_html(response.text)
+
+    if content_html == "<p>Content not found.</p>":
+        raise ValueError("Article body was not found")
+
+    return content_html
+
+#def fetch_article_html(url):
+#    # Keep the original /f/... URL from the source RSS feed.
+#    response = requests.get(
+#        url,
+#        headers=HEADERS,
+#        timeout=ARTICLE_TIMEOUT,
+#    )
+#    response.raise_for_status()
+#
+#    return extract_article_html(response.text)
 
 
 def generate_feed():
