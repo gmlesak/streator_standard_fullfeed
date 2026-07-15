@@ -29,22 +29,17 @@ cached_feed = None
 def extract_article_html(html: str) -> str:
     """
     The article body appears directly in the HTML as a large block of text
-    separated by <br> tags, not inside any wrapper element.
-
-    Strategy:
-    - Find the largest block of text containing many <br> tags.
-    - Return that block as the article HTML.
+    separated by <br><br> sequences. We extract the largest such block.
     """
 
-    # Find all large <br>-heavy blocks
+    # Find all blocks with repeated <br><br>
     blocks = re.findall(
-        r"((?:[^<]*<br\s*/?>){5,}[^<]*)",
+        r"((?:[^<]*<br\s*/?><br\s*/?>){3,}[^<]*)",
         html,
         re.DOTALL
     )
 
     if blocks:
-        # Return the largest block
         return max(blocks, key=len)
 
     return "Content not found."
