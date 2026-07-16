@@ -171,7 +171,6 @@ def extract_article_html(html):
 
     return "<p>Content not found.</p>"
 
-
 def fetch_article_html(url):
     logging.info("Playwright fetching: %s", url)
 
@@ -179,9 +178,16 @@ def fetch_article_html(url):
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
-        page.goto(url, timeout=ARTICLE_TIMEOUT, wait_until="networkidle")
-        html = page.content()
+        # Load page without waiting for full network idle
+        page.goto(url, timeout=ARTICLE_TIMEOUT, wait_until="domcontentloaded")
 
+        # Wait for article content to appear
+        try:
+            page.wait_for_selector("article, main, .entry-content", timeout=10000)
+        except:
+            logging.warning("Article selector not found, continuing anyway")
+
+        html = page.content()
         browser.close()
 
     content_html = extract_article_html(html)
