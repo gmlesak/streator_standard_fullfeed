@@ -161,9 +161,6 @@ def extract_article_html(html):
     selectors = [
         "[data-ux='BlogContent']",
         "[data-aid='BlogContent']",
-        "div.x-rt[data-ux='BlogContent']",
-        "[data-ux='Content']",
-        "section[data-ux='Section']",
         "[itemprop='articleBody']",
         ".article-body",
         ".article-content",
