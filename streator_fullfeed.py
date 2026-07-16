@@ -88,17 +88,16 @@ def save_article(url, title, content_html):
         """, (url, title, content_html))
 
 
-def remove_page_furniture(element):
-    for unwanted in element.select(
-        "script, style, noscript, nav, header, footer, form, aside, "
-        ".share, .social, .advertisement, .ad, .comments, .cookie"
-    ):
-        unwanted.decompose()
-
-
+# ------------------------------------------------------------
+# REMOVE FOOTER/SIDEBAR JUNK
+# ------------------------------------------------------------
 GENERIC_FOOTERS = [
+    "Join my email list",
+    "District 44 May Seek Forensic Audit Proposals",
     "The Streator Standard serves as a reliable news source",
-    "Do you have a story idea for us related to community updates",
+    "Do you have a story idea for us",
+    "This site is protected by reCAPTCHA",
+    "We use cookies to analyze website traffic",
 ]
 
 
@@ -108,41 +107,91 @@ def strip_generic_footers(html):
     return html
 
 
-def extract_json_ld_body(soup):
-    for script in soup.select('script[type="application/ld+json"]'):
-        try:
-            data = json.loads(script.string or "")
-        except (json.JSONDecodeError, TypeError):
+# ------------------------------------------------------------
+# PARSE _BLOG_DATA JSON
+# ------------------------------------------------------------
+def extract_blog_data_json(soup):
+    """
+    Extract the JSON inside window._BLOG_DATA = {...}
+    """
+    for script in soup.find_all("script"):
+        if not script.string:
             continue
-
-        records = data if isinstance(data, list) else [data]
-
-        for record in records:
-            if not isinstance(record, dict):
-                continue
-
-            candidates = [record]
-            if isinstance(record.get("@graph"), list):
-                candidates.extend(record["@graph"])
-
-            for candidate in candidates:
-                if not isinstance(candidate, dict):
+        if "window._BLOG_DATA" in script.string:
+            try:
+                # Extract JSON substring
+                match = re.search(r"window\._BLOG_DATA\s*=\s*(\{.*\});", script.string, re.DOTALL)
+                if not match:
                     continue
+                json_text = match.group(1)
 
-                body = candidate.get("articleBody")
-                if body and len(body.strip()) > 200:
-                    return "".join(
-                        f"<p>{escape(paragraph.strip())}</p>"
-                        for paragraph in body.splitlines()
-                        if paragraph.strip()
-                    )
+                data = json.loads(json_text)
+                return data
+            except Exception as e:
+                logging.warning(f"Could not parse _BLOG_DATA JSON: {e}")
+                return None
 
     return None
 
 
+# ------------------------------------------------------------
+# CONVERT DraftJS fullContent → HTML
+# ------------------------------------------------------------
+def draftjs_to_html(fullContent):
+    """
+    Convert DraftJS blocks into simple HTML paragraphs + images.
+    """
+    try:
+        data = json.loads(fullContent)
+    except Exception as e:
+        logging.warning(f"Could not parse DraftJS fullContent: {e}")
+        return None
+
+    blocks = data.get("blocks", [])
+    entityMap = data.get("entityMap", {})
+
+    html_parts = []
+
+    for block in blocks:
+        block_type = block.get("type")
+        text = block.get("text", "").strip()
+
+        # IMAGE BLOCK
+        if block_type == "atomic":
+            for entity_range in block.get("entityRanges", []):
+                key = entity_range.get("key")
+                entity = entityMap.get(str(key))
+                if entity and entity.get("type") == "IMAGE":
+                    src = entity["data"].get("src")
+                    if src:
+                        html_parts.append(f'<img src="{src}" style="max-width:100%;">')
+            continue
+
+        # NORMAL PARAGRAPH
+        if text:
+            html_parts.append(f"<p>{escape(text)}</p>")
+
+    return "\n".join(html_parts)
+
+
+# ------------------------------------------------------------
+# MAIN ARTICLE EXTRACTOR
+# ------------------------------------------------------------
 def extract_article_html(html):
     soup = BeautifulSoup(html, "html.parser")
 
+    # 1. Try extracting from _BLOG_DATA first (dynamic articles)
+    blog_data = extract_blog_data_json(soup)
+    if blog_data:
+        post = blog_data.get("post", {})
+        fullContent = post.get("fullContent")
+        if fullContent:
+            html_from_json = draftjs_to_html(fullContent)
+            if html_from_json:
+                logging.info("Extracted article from _BLOG_DATA JSON")
+                return strip_generic_footers(html_from_json)
+
+    # 2. Fallback: static HTML extraction
     selectors = [
         "[data-ux='BlogContent']",
         "[data-aid='BlogContent']",
@@ -167,57 +216,32 @@ def extract_article_html(html):
 
         logging.info(f"Matched selector: {selector}")
 
-        remove_page_furniture(content)
-
         if len(content.get_text(" ", strip=True)) > 300:
-            cleaned = strip_generic_footers(str(content))
-            return cleaned
-
-    json_ld_body = extract_json_ld_body(soup)
-    if json_ld_body:
-        return strip_generic_footers(json_ld_body)
-
-    paragraphs = []
-    for paragraph in soup.find_all("p"):
-        text = paragraph.get_text(" ", strip=True)
-        if len(text) >= 40:
-            paragraphs.append(f"<p>{escape(text)}</p>")
-
-    if len(paragraphs) >= 3:
-        return strip_generic_footers("".join(paragraphs))
+            return strip_generic_footers(str(content))
 
     return "<p>Content not found.</p>"
 
 
+# ------------------------------------------------------------
+# PLAYWRIGHT FETCHER
+# ------------------------------------------------------------
 def fetch_article_html(url):
     logging.info("Playwright fetching: %s", url)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-web-security",
-                "--disable-features=IsolateOrigins,site-per-process",
-            ],
+            args=["--disable-blink-features=AutomationControlled"],
         )
 
         context = browser.new_context(
             user_agent=HEADERS["User-Agent"],
             viewport={"width": 1280, "height": 800},
-            device_scale_factor=1,
-            locale="en-US",
             java_script_enabled=True,
         )
 
         page = context.new_page()
-
         page.goto(url, timeout=ARTICLE_TIMEOUT, wait_until="domcontentloaded")
-
-        try:
-            page.wait_for_selector("[data-ux='BlogContent'], article, main", timeout=12000)
-        except:
-            logging.warning("Article selector not found, continuing anyway")
 
         html = page.content()
         browser.close()
@@ -230,6 +254,9 @@ def fetch_article_html(url):
     return content_html
 
 
+# ------------------------------------------------------------
+# FEED GENERATION
+# ------------------------------------------------------------
 def generate_feed():
     global cached_feed
 
