@@ -3,3 +3,4 @@ beautifulsoup4
 feedgen
 flask
 playwright
+playwright-stealth
