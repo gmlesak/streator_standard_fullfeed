@@ -88,6 +88,27 @@ def save_article(url, title, content_html):
         """, (url, title, content_html))
 
 
+# ------------------------------------------------------------
+# REMOVE GENERIC FOOTERS (the two you identified + related junk)
+# ------------------------------------------------------------
+def remove_generic_footers(soup):
+    footer_phrases = [
+        "The Streator Standard serves as a reliable news source",
+        "Do you have a story idea for us",
+        "Send us a message and share what you are thinking about",
+        "We use cookies to analyze website traffic",
+        "This site is protected by reCAPTCHA",
+        "Join my email list",
+        "District 44 May Seek Forensic Audit Proposals",  # appears in footer block
+        "The Shallow Grave on South Bloomington Street",  # appears in footer block
+    ]
+
+    for phrase in footer_phrases:
+        for tag in soup.find_all(string=lambda text: text and phrase in text):
+            parent = tag.parent
+            parent.decompose()
+
+
 def remove_page_furniture(element):
     for unwanted in element.select(
         "script, style, noscript, nav, header, footer, form, aside, "
@@ -128,11 +149,21 @@ def extract_json_ld_body(soup):
     return None
 
 
+# ------------------------------------------------------------
+# MAIN ARTICLE EXTRACTOR (updated selectors + footer removal)
+# ------------------------------------------------------------
 def extract_article_html(html):
     soup = BeautifulSoup(html, "html.parser")
 
+    # Remove generic footers BEFORE extraction
+    remove_generic_footers(soup)
+
     selectors = [
         "[data-ux='BlogContent']",
+        "[data-aid='BlogContent']",
+        "div.x-rt[data-ux='BlogContent']",
+        "[data-ux='Content']",
+        "section[data-ux='Section']",
         "[itemprop='articleBody']",
         ".article-body",
         ".article-content",
@@ -172,6 +203,10 @@ def extract_article_html(html):
 
     return "<p>Content not found.</p>"
 
+
+# ------------------------------------------------------------
+# PLAYWRIGHT FETCHER
+# ------------------------------------------------------------
 def fetch_article_html(url):
     logging.info("Playwright fetching: %s", url)
 
@@ -179,12 +214,10 @@ def fetch_article_html(url):
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
-        # Load page without waiting for full network idle
         page.goto(url, timeout=ARTICLE_TIMEOUT, wait_until="domcontentloaded")
 
-        # Wait for article content to appear
         try:
-            page.wait_for_selector("article, main, .entry-content", timeout=10000)
+            page.wait_for_selector("article, main, .entry-content, [data-ux='BlogContent']", timeout=10000)
         except:
             logging.warning("Article selector not found, continuing anyway")
 
@@ -199,6 +232,9 @@ def fetch_article_html(url):
     return content_html
 
 
+# ------------------------------------------------------------
+# FEED GENERATION
+# ------------------------------------------------------------
 def generate_feed():
     global cached_feed
 
