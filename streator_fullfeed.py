@@ -137,6 +137,7 @@ def extract_article_html(html):
         ".article-content",
         ".post-content",
         ".entry-content",
+        "[data-ux='BlogContent']",
         "article",
         "main",
     ]
