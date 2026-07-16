@@ -139,7 +139,9 @@ def extract_blog_data_json(soup):
 # ------------------------------------------------------------
 def draftjs_to_html(fullContent):
     """
-    Convert DraftJS blocks into simple HTML paragraphs + images.
+    Convert DraftJS blocks into proper HTML paragraphs + images,
+    preserving internal paragraph breaks exactly as they appear
+    on thestreatorstandard.com.
     """
     try:
         data = json.loads(fullContent)
@@ -154,9 +156,8 @@ def draftjs_to_html(fullContent):
 
     for block in blocks:
         block_type = block.get("type")
-        text = block.get("text", "").strip()
+        text = block.get("text", "")
 
-        # IMAGE BLOCK
         if block_type == "atomic":
             for entity_range in block.get("entityRanges", []):
                 key = entity_range.get("key")
@@ -167,9 +168,15 @@ def draftjs_to_html(fullContent):
                         html_parts.append(f'<img src="{src}" style="max-width:100%;">')
             continue
 
-        # NORMAL PARAGRAPH
-        if text:
-            html_parts.append(f"<p>{escape(text)}</p>")
+        # TEXT BLOCK — preserve paragraph breaks
+        if text.strip():
+            # Split on double newlines → paragraphs
+            paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+
+            for para in paragraphs:
+                # Replace single newlines with <br>
+                para = escape(para).replace("\n", "<br>")
+                html_parts.append(f"<p>{para}</p>")
 
     return "\n".join(html_parts)
 
