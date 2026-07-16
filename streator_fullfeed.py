@@ -132,12 +132,12 @@ def extract_article_html(html):
     soup = BeautifulSoup(html, "html.parser")
 
     selectors = [
+        "[data-ux='BlogContent']",
         "[itemprop='articleBody']",
         ".article-body",
         ".article-content",
         ".post-content",
         ".entry-content",
-        "[data-ux='BlogContent']",
         "article",
         "main",
     ]
