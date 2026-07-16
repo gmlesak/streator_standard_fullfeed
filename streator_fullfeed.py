@@ -13,14 +13,16 @@ from bs4 import BeautifulSoup
 from feedgen.feed import FeedGenerator
 from flask import Flask, Response
 
+from playwright.sync_api import sync_playwright
+
 FEED_URL = "https://thestreatorstandard.com/f.rss"
 
-REFRESH_INTERVAL = 3600  # 60 minutes after a successful refresh
-RETRY_INTERVAL = 300     # Retry source-feed failure after 5 minutes
+REFRESH_INTERVAL = 3600
+RETRY_INTERVAL = 300
 
 RSS_TIMEOUT = 10
-ARTICLE_TIMEOUT = 15
-ARTICLE_DELAY = 1.0      # One second between article downloads during backfill
+ARTICLE_TIMEOUT = 15000
+ARTICLE_DELAY = 1.0
 
 DB_PATH = os.environ.get("DB_PATH", "/data/feed_cache.db")
 
@@ -127,7 +129,6 @@ def extract_json_ld_body(soup):
 
 
 def extract_article_html(html):
-    """Extract the full article body from a Streator Standard article page."""
     soup = BeautifulSoup(html, "html.parser")
 
     selectors = [
@@ -142,7 +143,6 @@ def extract_article_html(html):
 
     for selector in selectors:
         candidates = soup.select(selector)
-
         if not candidates:
             continue
 
@@ -169,51 +169,33 @@ def extract_article_html(html):
     if len(paragraphs) >= 3:
         return "".join(paragraphs)
 
-    # Fallback for pages using repeated <br> tags instead of <p> tags.
-    blocks = re.findall(
-        r"((?:[^<]*<br\s*/?>\s*){3,}[^<]*)",
-        html,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-
-    if blocks:
-        return max(blocks, key=len)
-
     return "<p>Content not found.</p>"
 
-def fetch_article_html(url):
-    response = requests.get(
-        url,
-        headers=HEADERS,
-        timeout=ARTICLE_TIMEOUT,
-    )
-    response.raise_for_status()
 
-    content_html = extract_article_html(response.text)
+def fetch_article_html(url):
+    logging.info("Playwright fetching: %s", url)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        page.goto(url, timeout=ARTICLE_TIMEOUT, wait_until="networkidle")
+        html = page.content()
+
+        browser.close()
+
+    content_html = extract_article_html(html)
 
     if content_html == "<p>Content not found.</p>":
         raise ValueError("Article body was not found")
 
     return content_html
 
-#def fetch_article_html(url):
-#    # Keep the original /f/... URL from the source RSS feed.
-#    response = requests.get(
-#        url,
-#        headers=HEADERS,
-#        timeout=ARTICLE_TIMEOUT,
-#    )
-#    response.raise_for_status()
-#
-#    return extract_article_html(response.text)
-
 
 def generate_feed():
-    """Create the full-text RSS feed and cache uncached article bodies."""
     global cached_feed
 
     try:
-        # Uses the same request pattern as the original working script.
         response = requests.get(
             FEED_URL,
             headers=HEADERS,
@@ -248,28 +230,14 @@ def generate_feed():
 
         content_html = get_cached_article(article_url)
 
-        # Download only articles that have never been cached.
         if content_html is None:
             try:
                 content_html = fetch_article_html(article_url)
                 save_article(article_url, title, content_html)
                 logging.info("Downloaded and cached: %s", title)
-
-                # Keep the one-time historical backfill gentle.
                 time.sleep(ARTICLE_DELAY)
 
-            except requests.RequestException as error:
-                logging.warning(
-                    "Could not download %s: %s",
-                    article_url,
-                    error,
-                )
-                content_html = (
-                    "<p>Full article content is temporarily unavailable. "
-                    "It will be retried during the next refresh.</p>"
-                )
-
-            except Exception:
+            except Exception as error:
                 logging.exception("Could not extract article: %s", article_url)
                 content_html = (
                     "<p>Full article content could not be extracted yet. "
