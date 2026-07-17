@@ -180,6 +180,48 @@ def draftjs_to_html(fullContent):
 
     return "\n".join(html_parts)
 
+def normalize_paragraphs(html_fragment):
+    """
+    Convert arbitrary HTML (static article body) into clean paragraphs.
+    Handles:
+    - <p>
+    - <br>
+    - DraftJS-style <div> blocks
+    - Inline spans
+    - Raw text nodes
+    """
+
+    soup = BeautifulSoup(html_fragment, "html.parser")
+
+    paragraphs = []
+
+    # 1. Real <p> tags
+    p_tags = soup.find_all("p")
+    if p_tags:
+        for p in p_tags:
+            text = p.get_text(strip=True)
+            if text:
+                paragraphs.append(f"<p>{text}</p>")
+        return "\n".join(paragraphs)
+
+    # 2. DraftJS-style <div> blocks
+    div_blocks = soup.find_all("div")
+    div_texts = [d.get_text(strip=True) for d in div_blocks if d.get_text(strip=True)]
+    if div_texts:
+        return "\n".join(f"<p>{t}</p>" for t in div_texts)
+
+    # 3. Split on <br>
+    html_str = str(soup)
+    parts = re.split(r"<br\s*/?>", html_str)
+    cleaned = [BeautifulSoup(p, "html.parser").get_text(strip=True) for p in parts]
+    cleaned = [c for c in cleaned if c]
+    if cleaned:
+        return "\n".join(f"<p>{c}</p>" for c in cleaned)
+
+    # 4. Fallback: raw text
+    raw = soup.get_text("\n", strip=True)
+    lines = [l.strip() for l in raw.split("\n") if l.strip()]
+    return "\n".join(f"<p>{l}</p>" for l in lines)
 
 # ------------------------------------------------------------
 # MAIN ARTICLE EXTRACTOR
@@ -224,7 +266,8 @@ def extract_article_html(html):
         logging.info(f"Matched selector: {selector}")
 
         if len(content.get_text(" ", strip=True)) > 300:
-            return strip_generic_footers(str(content))
+            normalized = normalize_paragraphs(str(content))
+            return strip_generic_footers(normalized)
 
     return "<p>Content not found.</p>"
 
